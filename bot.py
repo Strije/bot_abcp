@@ -23,7 +23,13 @@ from telegram.ext import (
 from telegram.error import BadRequest
 from api import get_user_by_phone, get_orders_by_user_id
 from auth import extract_phone_number, save_user
-from db import init_db, get_all_users
+from db import (
+    init_db,
+    get_all_users,
+    get_order_status,
+    get_order_message,
+    update_order_status,
+)
 from config import BOT_TOKEN, OFFICE_ALIASES
 from logs_setup import setup_logging
 
@@ -652,34 +658,51 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
 # =========================
 # ВАЧДОГ: периодическая проверка заказов (каждые 60 сек)
 # =========================
-def build_changes_messages_for_user(user: dict) -> list[tuple[int, str]]:
-    """
-    Возвращает список (chat_id, message) для отправки,
-    только если у заказа изменился «сводный текст по позициям».
-    """
+def build_changes_actions_for_user(user: dict) -> list[dict]:
+    """Готовит действия по уведомлению пользователя об изменениях заказов."""
+
     chat_id = user.get("telegram_id") or user.get("chat_id")
     user_id = user.get("user_id") or user.get("abcp_user_id")
     if not chat_id or not user_id:
         logger.warning(f"⛔ Пропущен пользователь (нет chat_id или user_id): {user}")
         return []
 
-    orders = get_orders_by_user_id(user_id)
-    messages: list[tuple[int, str]] = []
+    try:
+        orders = get_orders_by_user_id(user_id) or []
+    except Exception as e:
+        logger.exception(f"[WD] Не удалось получить заказы пользователя {user_id}: {e}")
+        return []
+
+    actions: list[dict] = []
 
     for order in orders:
-        num = order.get("number")
-        if num is None:
+        number = order.get("number")
+        if number is None:
             continue
-        num_str = str(num)
-        text = format_order_status(order)
-        prev = _status_cache.get(num_str)
 
-        if text != prev:
-            # Изменилась любая позиция/статус — отправим
-            messages.append((chat_id, f"📢 Обновление статусов:\n\n{text}"))
-            _status_cache[num_str] = text
+        number_str = str(number)
+        fresh_text = format_order_status(order)
+        cache_text = _status_cache.get(number_str)
+        stored_status = get_order_status(number_str)
+        stored_message_id = get_order_message(number_str)
 
-    return messages
+        if fresh_text == cache_text or fresh_text == stored_status:
+            if cache_text != fresh_text:
+                _status_cache[number_str] = fresh_text
+            continue
+
+        actions.append(
+            {
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "order_number": number_str,
+                "message_id": stored_message_id,
+                "text": f"📢 Обновление статусов:\n\n{fresh_text}",
+                "raw_text": fresh_text,
+            }
+        )
+
+    return actions
 
 
 async def watchdog_job(context: ContextTypes.DEFAULT_TYPE):
@@ -690,19 +713,52 @@ async def watchdog_job(context: ContextTypes.DEFAULT_TYPE):
             logger.info("[WD] Пользователей нет.")
             return
 
-        total_msgs = 0
+        total_updates = 0
         for u in users:
-            msgs = await asyncio.to_thread(build_changes_messages_for_user, u)
-            for chat_id, text in msgs:
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=text)
-                    total_msgs += 1
-                except Exception as e:
-                    logger.exception(f"[WD] Ошибка отправки сообщения пользователю {chat_id}: {e}")
+            actions = await asyncio.to_thread(build_changes_actions_for_user, u)
+            for action in actions:
+                chat_id = action["chat_id"]
+                order_number = action["order_number"]
+                raw_text = action["raw_text"]
+                message_id = action.get("message_id")
 
-        if total_msgs:
+                try:
+                    new_message_id = message_id
+                    if message_id:
+                        try:
+                            await context.bot.edit_message_text(
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                text=action["text"],
+                            )
+                        except BadRequest as exc:
+                            logger.debug(
+                                f"[WD] Не удалось обновить сообщение заказа {order_number}: {exc}. Переотправляем."
+                            )
+                            new_message_id = None
+                    if not new_message_id:
+                        sent = await context.bot.send_message(
+                            chat_id=chat_id, text=action["text"]
+                        )
+                        new_message_id = sent.message_id
+
+                    await asyncio.to_thread(
+                        update_order_status,
+                        order_number,
+                        action["user_id"],
+                        raw_text,
+                        new_message_id,
+                    )
+                    _status_cache[order_number] = raw_text
+                    total_updates += 1
+                except Exception as e:
+                    logger.exception(
+                        f"[WD] Ошибка обработки уведомления по заказу {order_number} для пользователя {chat_id}: {e}"
+                    )
+
+        if total_updates:
             save_cache()
-            logger.info(f"[WD] Отправлено уведомлений: {total_msgs}")
+            logger.info(f"[WD] Обновлено уведомлений: {total_updates}")
         else:
             logger.info("[WD] Изменений нет.")
 
