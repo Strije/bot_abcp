@@ -3,7 +3,13 @@ import asyncio
 import json
 import os
 from datetime import datetime
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -11,8 +17,10 @@ from telegram.ext import (
     ContextTypes,
     JobQueue,
     Job,
+    CallbackQueryHandler,
     filters,
 )
+from telegram.error import BadRequest
 from api import get_user_by_phone, get_orders_by_user_id
 from auth import extract_phone_number, save_user
 from db import init_db, get_all_users
@@ -71,26 +79,171 @@ def format_order_status(order: dict) -> str:
     """Формирует текст статусов по позициям + адрес офиса."""
     number = order.get("number", "-")
     delivery_office = order.get("deliveryOffice", "") or ""
-    office_address = OFFICE_ALIASES.get(delivery_office, delivery_office)
+    office_address = OFFICE_ALIASES.get(delivery_office, delivery_office) or "—"
+    date = order.get("date", "-")
+    total = order.get("sum", "0")
+    payment_type = order.get("paymentType", "—")
+    paid = bool(order.get("paid"))
+    comment = (order.get("comment") or "").strip()
 
-    lines = [f"📦 Заказ №{number}", f"🏢 Офис: {office_address}\n"]
-    for pos in order.get("positions", []):
-        brand = (pos.get("brand") or "").strip()
-        desc = (pos.get("description") or "").strip()
-        status = pos.get("status") or ""
-        price = pos.get("priceOut", "")
-        qty = pos.get("quantity", "1")
+    lines = [
+        f"📦 Заказ №{number}",
+        f"📅 Дата: {date}",
+        f"🏢 Офис: {office_address}",
+        f"💳 Способ оплаты: {payment_type}",
+        f"💰 Сумма: {total} ₽",
+        f"📍 Статус счёта: {'✅ Оплачен' if paid else '⏳ Не оплачен'}",
+    ]
 
-        lines.append(
-            f"{emoji_for_status_line(status)} {brand} {desc}\n"
-            f"   💵 {price} ₽ × {qty}\n"
-            f"   📄 {status}"
-        )
+    if comment:
+        lines.append(f"💬 Комментарий: {comment}")
+
+    positions = order.get("positions", []) or []
+    if positions:
+        lines.append("")
+        lines.append("🧾 Позиции:")
+        for pos in positions:
+            brand = (pos.get("brand") or "").strip()
+            desc = (pos.get("description") or "").strip()
+            status = pos.get("status") or ""
+            price = pos.get("priceOut", "")
+            qty = pos.get("quantity", "1")
+
+            label = " ".join(filter(None, [brand, desc])) or "Позиция"
+            lines.append(f"{emoji_for_status_line(status)} {label}")
+            lines.append(f"   📄 {status}")
+            lines.append(f"   📦 Кол-во: {qty} | 💵 {price} ₽")
+            lines.append("")
+        if lines and lines[-1] == "":
+            lines.pop()
+    else:
+        lines.append("")
+        lines.append("🧾 Позиции: нет данных")
+
     return "\n".join(lines)
 
 
+def format_order_detail(order: dict) -> str:
+    body = format_order_status(order)
+    return f"{body}\n\nℹ️ Используйте кнопки ниже, чтобы вернуться к списку или обновить заказ."
+
+
+def format_orders_overview(orders: list[dict]) -> str:
+    if not orders:
+        return "🕐 Активных заказов нет."
+
+    lines = [
+        f"📋 Найдено заказов: {len(orders)}",
+        "Выберите заказ на клавиатуре ниже, чтобы посмотреть детали.",
+        "",
+    ]
+
+    for idx, order in enumerate(orders, start=1):
+        number = order.get("number", "-")
+        date = order.get("date", "-")
+        total = order.get("sum", "0")
+        paid = bool(order.get("paid"))
+        positions = order.get("positions", []) or []
+        first_status = next((p.get("status") for p in positions if p.get("status")), "Статус неизвестен")
+        lines.append(
+            f"{idx}. №{number} • {date} • {emoji_for_status_line(first_status)} {first_status} • {total} ₽ • {'✅ Оплачен' if paid else '⏳ Не оплачен'}"
+        )
+
+    return "\n".join(lines)
+
+
+def build_orders_keyboard(orders: list[dict]) -> InlineKeyboardMarkup:
+    if not orders:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="orders:refresh")]])
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+
+    for order in orders:
+        number = str(order.get("number", "-"))
+        total = order.get("sum")
+        title = f"№{number}"
+        if total not in (None, ""):
+            title += f" · {total} ₽"
+
+        row.append(InlineKeyboardButton(title, callback_data=f"order:{number}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+
+    if row:
+        buttons.append(row)
+
+    buttons.append([InlineKeyboardButton("🔄 Обновить список", callback_data="orders:refresh")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def update_cache_from_orders(orders: list[dict]):
+    changed = False
+    for order in orders:
+        number = order.get("number")
+        if number is None:
+            continue
+        number_str = str(number)
+        text = format_order_status(order)
+        if _status_cache.get(number_str) != text:
+            changed = True
+        _status_cache[number_str] = text
+    if changed:
+        save_cache()
+
+
+async def safe_edit_message_text(
+    bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+        )
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            if reply_markup is not None:
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=reply_markup,
+                    )
+                except BadRequest:
+                    pass
+            return True
+        raise
+
+
+async def safe_edit_query_message(
+    query,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> bool:
+    try:
+        await query.edit_message_text(text=text, reply_markup=reply_markup)
+        return True
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            if reply_markup is not None:
+                try:
+                    await query.edit_message_reply_markup(reply_markup=reply_markup)
+                except BadRequest:
+                    pass
+            return True
+        raise
+
+
 # =========================
-# ХЭНДЛЕРЫ БОТА (без inline-кнопок — всё просто и надёжно)
+# ХЭНДЛЕРЫ БОТА
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие + запрос номера телефона."""
@@ -103,7 +256,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Авторизация и моментальный вывод заказов (с позициями построчно)."""
+    """Авторизация и аккуратное отображение списка заказов."""
     try:
         # Получаем телефон
         if update.message.contact:
@@ -154,47 +307,232 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Загружаем список заказов..."
         )
 
-        # Грузим заказы
-        orders = get_orders_by_user_id(user_id)
+        context.user_data["abcp_user_id"] = user_id
+        context.user_data["customer_name"] = name
+
+        # Грузим заказы и сохраняем в user_data
+        orders = await asyncio.to_thread(get_orders_by_user_id, user_id)
         logger.info(f"Получено заказов: {len(orders)}")
 
+        chat_id = update.effective_chat.id
+        context.user_data["active_chat_id"] = chat_id
+        context.user_data["orders_list"] = orders or []
+        context.user_data["orders_map"] = {
+            str(order.get("number")): order for order in (orders or []) if order.get("number")
+        }
+
         if not orders:
-            await update.message.reply_text("🕐 У вас пока нет заказов.")
+            empty_text = "🕐 У вас пока нет заказов."
+            keyboard = build_orders_keyboard([])
+            prev_message_id = context.user_data.get("active_message_id")
+            if prev_message_id:
+                try:
+                    await safe_edit_message_text(
+                        context.bot,
+                        chat_id,
+                        prev_message_id,
+                        empty_text,
+                        reply_markup=keyboard,
+                    )
+                except Exception as edit_error:
+                    logger.debug(f"Не удалось обновить прошлое сообщение: {edit_error}")
+                    try:
+                        await context.bot.delete_message(chat_id=chat_id, message_id=prev_message_id)
+                    except Exception:
+                        pass
+                    msg = await update.message.reply_text(empty_text, reply_markup=keyboard)
+                    context.user_data["active_message_id"] = msg.message_id
+            else:
+                msg = await update.message.reply_text(empty_text, reply_markup=keyboard)
+                context.user_data["active_message_id"] = msg.message_id
+
+            context.user_data["orders_overview_text"] = empty_text
+            update_cache_from_orders([])
             return
 
-        # Выводим каждый заказ: шапка + позиции построчно
-        for order in orders:
-            office = OFFICE_ALIASES.get(order.get("deliveryOffice", ""), "—")
-            header = (
-                f"📦 Заказ №{order.get('number', '-')}\n"
-                f"📅 {order.get('date', '-')}\n"
-                f"🏬 {office}\n"
-                f"💰 Сумма: {order.get('sum', 0)} ₽\n"
-                f"💳 Оплата: {order.get('paymentType', '-')}\n"
-                f"📍 Статус: {'Оплачен' if order.get('paid') else 'Не оплачен'}\n\n"
-                f"🧾 Позиции:"
-            )
-            await update.message.reply_text(header)
+        update_cache_from_orders(orders)
 
-            for pos in order.get("positions", []):
-                brand = pos.get("brand", "")
-                desc = pos.get("description", "")
-                status = pos.get("status", "")
-                price = pos.get("priceOut", "")
-                quantity = pos.get("quantity", "1")
+        overview_text = format_orders_overview(orders)
+        refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        overview_text = f"{overview_text}\n\n🔄 Обновлено: {refreshed_at}"
+        keyboard = build_orders_keyboard(orders)
 
-                emoji = emoji_for_status_line(status)
-                text = (
-                    f"{emoji} {brand} {desc}\n"
-                    f"   💵 {price} ₽ × {quantity}\n"
-                    f"   📄 {status}\n"
+        prev_message_id = context.user_data.get("active_message_id")
+        if prev_message_id:
+            try:
+                await safe_edit_message_text(
+                    context.bot,
+                    chat_id,
+                    prev_message_id,
+                    overview_text,
+                    reply_markup=keyboard,
                 )
-                await update.message.reply_text(text)
+            except Exception as edit_error:
+                logger.debug(f"Не удалось обновить прошлое сообщение: {edit_error}")
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=prev_message_id)
+                except Exception:
+                    pass
+                msg = await update.message.reply_text(overview_text, reply_markup=keyboard)
+                context.user_data["active_message_id"] = msg.message_id
+        else:
+            msg = await update.message.reply_text(overview_text, reply_markup=keyboard)
+            context.user_data["active_message_id"] = msg.message_id
+
+        context.user_data["orders_overview_text"] = overview_text
+        context.user_data["orders_last_synced"] = refreshed_at
+        context.user_data["view"] = "overview"
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
         await update.message.reply_text("⚠️ Ошибка при загрузке заказов. Подробности в логах.")
 
+
+async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка inline-кнопок со списком заказов."""
+    query = update.callback_query
+    if not query:
+        return
+
+    data = (query.data or "").strip()
+    chat_id = query.message.chat.id
+    context.user_data["active_chat_id"] = chat_id
+    context.user_data["active_message_id"] = query.message.message_id
+
+    async def sync_orders() -> tuple[list[dict], str] | None:
+        user_id = context.user_data.get("abcp_user_id")
+        if not user_id:
+            await query.answer("Нет данных для обновления", show_alert=True)
+            return None
+
+        orders = await asyncio.to_thread(get_orders_by_user_id, user_id)
+        orders_list = orders or []
+        context.user_data["orders_list"] = orders_list
+        context.user_data["orders_map"] = {
+            str(order.get("number")): order
+            for order in orders_list
+            if order.get("number")
+        }
+        update_cache_from_orders(orders_list)
+        refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        context.user_data["orders_last_synced"] = refreshed_at
+        overview_text = format_orders_overview(orders_list)
+        overview_text = f"{overview_text}\n\n🔄 Обновлено: {refreshed_at}"
+        context.user_data["orders_overview_text"] = overview_text
+        return orders_list, overview_text
+
+    if data == "orders:back":
+        orders = context.user_data.get("orders_list", [])
+        text_block = context.user_data.get("orders_overview_text")
+        if text_block is None:
+            synced = await sync_orders()
+            if not synced:
+                return
+            orders, text_block = synced
+        keyboard = build_orders_keyboard(orders)
+        try:
+            await safe_edit_query_message(query, text_block, keyboard)
+        except Exception as edit_error:
+            logger.debug(f"Не удалось показать список заказов: {edit_error}")
+        await query.answer()
+        context.user_data["view"] = "overview"
+        return
+
+    if data == "orders:refresh":
+        synced = await sync_orders()
+        if not synced:
+            return
+        orders, text_block = synced
+        try:
+            await safe_edit_query_message(query, text_block, build_orders_keyboard(orders))
+        except Exception as edit_error:
+            logger.debug(f"Не удалось обновить список заказов: {edit_error}")
+        await query.answer("Список обновлён ✅", show_alert=False)
+        context.user_data["view"] = "overview"
+        return
+
+    if data.startswith("order-refresh:"):
+        number = data.split(":", 1)[1]
+        synced = await sync_orders()
+        if not synced:
+            return
+        order = context.user_data.get("orders_map", {}).get(number)
+        if not order:
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⬅️ Назад к списку", callback_data="orders:back")],
+                    [InlineKeyboardButton("🔄 Обновить список", callback_data="orders:refresh")],
+                ]
+            )
+            try:
+                await safe_edit_query_message(
+                    query,
+                    "❌ Заказ не найден. Возможно, он был закрыт или удалён.",
+                    keyboard,
+                )
+            except Exception as edit_error:
+                logger.debug(f"Не удалось показать сообщение об отсутствии заказа: {edit_error}")
+            await query.answer("Заказ не найден", show_alert=True)
+            context.user_data["view"] = "overview"
+            return
+
+        detail_text = format_order_detail(order)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⬅️ Назад к списку", callback_data="orders:back")],
+                [InlineKeyboardButton("🔄 Обновить заказ", callback_data=f"order-refresh:{number}")],
+            ]
+        )
+        try:
+            await safe_edit_query_message(query, detail_text, keyboard)
+        except Exception as edit_error:
+            logger.debug(f"Не удалось обновить детали заказа: {edit_error}")
+        await query.answer("Детали обновлены ✅", show_alert=False)
+        context.user_data["view"] = f"order:{number}"
+        return
+
+    if data.startswith("order:"):
+        number = data.split(":", 1)[1]
+        orders_map = context.user_data.get("orders_map", {})
+        order = orders_map.get(number)
+        if not order:
+            synced = await sync_orders()
+            if not synced:
+                return
+            order = context.user_data.get("orders_map", {}).get(number)
+
+        if not order:
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔄 Обновить список", callback_data="orders:refresh")]]
+            )
+            try:
+                await safe_edit_query_message(
+                    query,
+                    "❌ Не удалось найти заказ. Обновите список и попробуйте снова.",
+                    keyboard,
+                )
+            except Exception as edit_error:
+                logger.debug(f"Не удалось показать сообщение об отсутствии заказа: {edit_error}")
+            await query.answer("Заказ не найден", show_alert=True)
+            context.user_data["view"] = "overview"
+            return
+
+        detail_text = format_order_detail(order)
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⬅️ Назад к списку", callback_data="orders:back")],
+                [InlineKeyboardButton("🔄 Обновить заказ", callback_data=f"order-refresh:{number}")],
+            ]
+        )
+        try:
+            await safe_edit_query_message(query, detail_text, keyboard)
+        except Exception as edit_error:
+            logger.debug(f"Не удалось показать детали заказа: {edit_error}")
+        await query.answer()
+        context.user_data["view"] = f"order:{number}"
+        return
+
+    await query.answer()
 
 # =========================
 # ВАЧДОГ: периодическая проверка заказов (каждые 60 сек)
@@ -215,13 +553,16 @@ def build_changes_messages_for_user(user: dict) -> list[tuple[int, str]]:
 
     for order in orders:
         num = order.get("number")
+        if num is None:
+            continue
+        num_str = str(num)
         text = format_order_status(order)
-        prev = _status_cache.get(num)
+        prev = _status_cache.get(num_str)
 
         if text != prev:
             # Изменилась любая позиция/статус — отправим
             messages.append((chat_id, f"📢 Обновление статусов:\n\n{text}"))
-            _status_cache[num] = text
+            _status_cache[num_str] = text
 
     return messages
 
@@ -271,6 +612,7 @@ if __name__ == "__main__":
 
     # Хэндлеры
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_orders_callback))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
 
