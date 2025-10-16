@@ -2,6 +2,7 @@ import sys
 import asyncio
 import json
 import os
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -29,6 +30,8 @@ logger = setup_logging("logs/bot.log")
 # =========================
 CACHE_FILE = "status_cache.json"
 _status_cache: dict[str, str] = {}  # {order_number: formatted_text}
+MANUAL_AUTH_KEY = "manual_auth_pending"
+MANUAL_AUTH_MAX_ATTEMPTS = 3
 
 
 def load_cache() -> dict:
@@ -89,6 +92,93 @@ def format_order_status(order: dict) -> str:
     return "\n".join(lines)
 
 
+def normalize_order_number(value: str) -> str:
+    return "".join(ch for ch in (value or "") if ch.isdigit())
+
+
+def parse_order_sum(value: str | int | float | Decimal | None) -> Decimal | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return Decimal(str(value)).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            return None
+    cleaned = str(value).replace("₽", "").replace(" ", "").replace("\u00a0", "").strip()
+    cleaned = cleaned.replace(",", ".")
+    if not cleaned:
+        return None
+    try:
+        return Decimal(cleaned).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def has_manual_verification_data(order: dict) -> bool:
+    number = normalize_order_number(str(order.get("number", "")))
+    order_sum = parse_order_sum(order.get("sum"))
+    return bool(number or order_sum is not None)
+
+
+async def finalize_authorization(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user: dict,
+    orders: list[dict] | None,
+    phone: str,
+):
+    user_id = user.get("userId")
+    name = user.get("name", "—")
+    balance = user.get("balance", "0.00")
+    debt = user.get("debt", "0.00")
+
+    save_user(update.effective_user.id, phone, user_id)
+    logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
+
+    await update.message.reply_text(
+        f"✅ Авторизация прошла успешно!\n"
+        f"👤 {name}\n"
+        f"💰 Баланс: {balance} ₽\n"
+        f"💸 Задолженность: {debt} ₽\n\n"
+        f"⏳ Загружаем список заказов..."
+    )
+
+    orders = orders or get_orders_by_user_id(user_id)
+    logger.info(f"Получено заказов: {len(orders)}")
+
+    if not orders:
+        await update.message.reply_text("🕐 У вас пока нет заказов.")
+        return
+
+    for order in orders:
+        office = OFFICE_ALIASES.get(order.get("deliveryOffice", ""), "—")
+        header = (
+            f"📦 Заказ №{order.get('number', '-')}\n"
+            f"📅 {order.get('date', '-')}\n"
+            f"🏬 {office}\n"
+            f"💰 Сумма: {order.get('sum', 0)} ₽\n"
+            f"💳 Оплата: {order.get('paymentType', '-')}\n"
+            f"📍 Статус: {'Оплачен' if order.get('paid') else 'Не оплачен'}\n\n"
+            f"🧾 Позиции:"
+        )
+        await update.message.reply_text(header)
+
+        for pos in order.get("positions", []):
+            brand = pos.get("brand", "")
+            desc = pos.get("description", "")
+            status = pos.get("status", "")
+            price = pos.get("priceOut", "")
+            quantity = pos.get("quantity", "1")
+
+            emoji = emoji_for_status_line(status)
+            text = (
+                f"{emoji} {brand} {desc}\n"
+                f"   💵 {price} ₽ × {quantity}\n"
+                f"   📄 {status}\n"
+            )
+            await update.message.reply_text(text)
+
+
 # =========================
 # ХЭНДЛЕРЫ БОТА (без inline-кнопок — всё просто и надёжно)
 # =========================
@@ -105,6 +195,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Авторизация и моментальный вывод заказов (с позициями построчно)."""
     try:
+        pending = context.user_data.get(MANUAL_AUTH_KEY)
+        if pending and update.message and not update.message.contact:
+            await process_manual_verification(update, context, pending)
+            return
+        if pending and update.message and update.message.contact:
+            # Пользователь решил отправить контакт вместо подтверждения — сбросим ожидание.
+            context.user_data.pop(MANUAL_AUTH_KEY, None)
+
         # Получаем телефон
         if update.message.contact:
             phone = update.message.contact.phone_number
@@ -138,62 +236,92 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         user_id = user.get("userId")
-        name = user.get("name", "—")
-        balance = user.get("balance", "0.00")
-        debt = user.get("debt", "0.00")
 
-        # Сохраняем в БД
-        save_user(update.effective_user.id, phone, user_id)
-        logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
-
-        await update.message.reply_text(
-            f"✅ Авторизация прошла успешно!\n"
-            f"👤 {name}\n"
-            f"💰 Баланс: {balance} ₽\n"
-            f"💸 Задолженность: {debt} ₽\n\n"
-            f"⏳ Загружаем список заказов..."
-        )
-
-        # Грузим заказы
+        # Грузим заказы заранее — пригодится и для верификации
         orders = get_orders_by_user_id(user_id)
-        logger.info(f"Получено заказов: {len(orders)}")
 
-        if not orders:
-            await update.message.reply_text("🕐 У вас пока нет заказов.")
-            return
-
-        # Выводим каждый заказ: шапка + позиции построчно
-        for order in orders:
-            office = OFFICE_ALIASES.get(order.get("deliveryOffice", ""), "—")
-            header = (
-                f"📦 Заказ №{order.get('number', '-')}\n"
-                f"📅 {order.get('date', '-')}\n"
-                f"🏬 {office}\n"
-                f"💰 Сумма: {order.get('sum', 0)} ₽\n"
-                f"💳 Оплата: {order.get('paymentType', '-')}\n"
-                f"📍 Статус: {'Оплачен' if order.get('paid') else 'Не оплачен'}\n\n"
-                f"🧾 Позиции:"
-            )
-            await update.message.reply_text(header)
-
-            for pos in order.get("positions", []):
-                brand = pos.get("brand", "")
-                desc = pos.get("description", "")
-                status = pos.get("status", "")
-                price = pos.get("priceOut", "")
-                quantity = pos.get("quantity", "1")
-
-                emoji = emoji_for_status_line(status)
-                text = (
-                    f"{emoji} {brand} {desc}\n"
-                    f"   💵 {price} ₽ × {quantity}\n"
-                    f"   📄 {status}\n"
+        if not update.message.contact:
+            if orders:
+                last_order = orders[0]
+                if has_manual_verification_data(last_order):
+                    expected_number = normalize_order_number(str(last_order.get("number", "")))
+                    expected_sum = parse_order_sum(last_order.get("sum"))
+                    context.user_data[MANUAL_AUTH_KEY] = {
+                        "phone": phone,
+                        "user": user,
+                        "orders": orders,
+                        "expected_number": expected_number,
+                        "expected_sum": expected_sum,
+                        "attempts": 0,
+                    }
+                    await update.message.reply_text(
+                        "🔐 Для подтверждения авторизации укажите номер последнего заказа "
+                        "(например 234717171) или его сумму (например 5 220,00)."
+                    )
+                    return
+            else:
+                logger.info(
+                    "Для пользователя %s нет заказов — дополнительная проверка пропущена.",
+                    user_id,
                 )
-                await update.message.reply_text(text)
+
+        await finalize_authorization(update, context, user, orders, phone)
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
         await update.message.reply_text("⚠️ Ошибка при загрузке заказов. Подробности в логах.")
+
+
+async def process_manual_verification(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    pending: dict,
+):
+    answer = (update.message.text or "").strip()
+    if not answer:
+        await update.message.reply_text(
+            "❌ Не удалось распознать ответ. Укажите номер последнего заказа или его сумму."
+        )
+        return
+
+    normalized_number = normalize_order_number(answer)
+    expected_number = pending.get("expected_number")
+    expected_sum = pending.get("expected_sum")
+
+    success = False
+
+    if expected_number and normalized_number and normalized_number == expected_number:
+        success = True
+    else:
+        provided_sum = parse_order_sum(answer)
+        if expected_sum is not None and provided_sum is not None and provided_sum == expected_sum:
+            success = True
+
+    if success:
+        context.user_data.pop(MANUAL_AUTH_KEY, None)
+        await finalize_authorization(
+            update,
+            context,
+            pending.get("user", {}),
+            pending.get("orders") or [],
+            pending.get("phone", ""),
+        )
+        return
+
+    pending["attempts"] = pending.get("attempts", 0) + 1
+
+    if pending["attempts"] >= MANUAL_AUTH_MAX_ATTEMPTS:
+        context.user_data.pop(MANUAL_AUTH_KEY, None)
+        await update.message.reply_text(
+            "❌ Не удалось подтвердить авторизацию. Отправьте контактный номер из Telegram "
+            "или обратитесь к менеджеру."
+        )
+        return
+
+    await update.message.reply_text(
+        "❌ Данные не совпадают. Попробуйте снова указать номер последнего заказа "
+        "или сумму в формате 5 220,00."
+    )
 
 
 # =========================
