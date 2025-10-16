@@ -373,10 +373,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         balance = user.get("balance", "0.00")
         debt = user.get("debt", "0.00")
 
-        # Сохраняем в БД
-        save_user(update.effective_user.id, phone, user_id)
-        logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
-
         await update.message.reply_text(
             f"✅ Авторизация прошла успешно!\n"
             f"👤 {name}\n"
@@ -433,6 +429,8 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["orders_overview_text"] = empty_text
             update_cache_from_orders([])
             await asyncio.to_thread(persist_orders_snapshot, user_id, [])
+            save_user(update.effective_user.id, phone, user_id)
+            logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
             return
 
         update_cache_from_orders(orders_list)
@@ -468,6 +466,9 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["orders_overview_text"] = overview_text
         context.user_data["orders_last_synced"] = refreshed_at
         context.user_data["view"] = "overview"
+
+        save_user(update.effective_user.id, phone, user_id)
+        logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
