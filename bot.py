@@ -7,8 +7,10 @@ from telegram import (
     Update,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    Message,
 )
 from telegram.ext import (
     Application,
@@ -413,10 +415,188 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def build_orders_menu_keyboard(current_filter: str | None = None) -> ReplyKeyboardMarkup:
+    """Основная клавиатура под полем ввода с быстрыми действиями."""
+
+    filter_labels = {
+        "all": "Фильтр: Все",
+        "active": "Фильтр: В работе",
+        "unpaid": "Фильтр: Неоплаченные",
+    }
+
+    rows = [
+        [KeyboardButton("📋 Мои заказы"), KeyboardButton("🔄 Обновить заказы")],
+        [
+            KeyboardButton(
+                ("✅ " if mode == current_filter else "") + label
+            )
+            for mode, label in filter_labels.items()
+        ],
+    ]
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+MENU_HINT_TEXT = "👇 Быстрые действия доступны на клавиатуре ниже."
+
+
+async def send_overview_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    overview_text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    """Редактирует существующее сообщение со списком заказов или отправляет новое."""
+
+    chat_id = context.user_data.get("active_chat_id") or update.effective_chat.id
+    context.user_data["active_chat_id"] = chat_id
+    prev_message_id = context.user_data.get("active_message_id")
+
+    if prev_message_id:
+        try:
+            await safe_edit_message_text(
+                context.bot,
+                chat_id,
+                prev_message_id,
+                overview_text,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as edit_error:
+            logger.debug(f"Не удалось обновить прошлое сообщение: {edit_error}")
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=prev_message_id)
+            except Exception:
+                pass
+
+    msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=overview_text,
+        reply_markup=keyboard,
+    )
+    context.user_data["active_message_id"] = msg.message_id
+
+
+async def try_delete_message(message: Message | None):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except BadRequest as exc:
+        if "message can't be deleted" in str(exc).lower():
+            return
+        logger.debug(f"Не удалось удалить сообщение пользователя: {exc}")
+    except Exception as error:
+        logger.debug(f"Ошибка при удалении сообщения пользователя: {error}")
+
+
+async def refresh_menu_keyboard(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id: int | None = None,
+    message_text: str | None = None,
+):
+    """Переотправляет клавиатуру с быстрыми действиями, чтобы обновить чекбоксы."""
+
+    target_chat = chat_id or context.user_data.get("active_chat_id")
+    if not target_chat:
+        return
+
+    keyboard = build_orders_menu_keyboard(context.user_data.get("orders_filter"))
+    text = message_text or MENU_HINT_TEXT
+    previous_menu_id = context.user_data.get("menu_message_id")
+
+    if previous_menu_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=target_chat, message_id=previous_menu_id
+            )
+        except BadRequest as exc:
+            if "message to delete not found" not in str(exc).lower():
+                logger.debug(f"Не удалось удалить прошлое меню: {exc}")
+        except Exception as error:
+            logger.debug(f"Ошибка при удалении меню: {error}")
+
+    sent = await context.bot.send_message(
+        chat_id=target_chat,
+        text=text,
+        reply_markup=keyboard,
+    )
+    context.user_data["menu_message_id"] = sent.message_id
+
+
+async def sync_orders_context(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    force_refresh: bool = False,
+    filter_mode: str | None = None,
+) -> tuple[list[dict], list[dict], str, InlineKeyboardMarkup] | None:
+    """Актуализирует кеш заказов в user_data и возвращает данные для отображения."""
+
+    user_id = context.user_data.get("abcp_user_id")
+    if not user_id:
+        return None
+
+    needs_fetch = force_refresh or context.user_data.get("orders_list") is None
+
+    if needs_fetch:
+        orders = await asyncio.to_thread(get_orders_by_user_id, user_id)
+        orders_list = orders or []
+        context.user_data["orders_list"] = orders_list
+        context.user_data["orders_map"] = {
+            str(order.get("number")): order
+            for order in orders_list
+            if order.get("number")
+        }
+        number_to_token, token_to_number = assign_order_tokens(
+            orders_list, context.user_data.get("orders_number_to_token")
+        )
+        context.user_data["orders_number_to_token"] = number_to_token
+        context.user_data["orders_token_to_number"] = token_to_number
+        update_cache_from_orders(orders_list)
+        await asyncio.to_thread(persist_orders_snapshot, user_id, orders_list)
+        refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+        context.user_data["orders_last_synced"] = refreshed_at
+    else:
+        orders_list = context.user_data.get("orders_list", [])
+        refreshed_at = context.user_data.get("orders_last_synced")
+        number_to_token = context.user_data.get("orders_number_to_token", {})
+        if not number_to_token and orders_list:
+            number_to_token, token_to_number = assign_order_tokens(orders_list)
+            context.user_data["orders_number_to_token"] = number_to_token
+            context.user_data["orders_token_to_number"] = token_to_number
+
+    metrics = context.user_data.get("orders_metrics") if not needs_fetch else None
+    if force_refresh or metrics is None:
+        metrics = calculate_orders_metrics(orders_list)
+        context.user_data["orders_metrics"] = metrics
+
+    current_filter = filter_mode or context.user_data.get("orders_filter")
+    if current_filter not in FILTER_MODES:
+        current_filter = "active" if metrics.get("active") else "all"
+    context.user_data["orders_filter"] = current_filter
+
+    filtered_orders = filter_orders_for_view(orders_list, current_filter)
+    context.user_data["orders_filtered_list"] = filtered_orders
+
+    refreshed_at = context.user_data.get("orders_last_synced")
+    overview_text = format_orders_overview(
+        filtered_orders,
+        metrics,
+        current_filter,
+        refreshed_at,
+    )
+    context.user_data["orders_overview_text"] = overview_text
+
+    number_to_token = context.user_data.get("orders_number_to_token", {})
+    keyboard = build_orders_keyboard(filtered_orders, number_to_token, current_filter)
+
+    return orders_list, filtered_orders, overview_text, keyboard
+
+
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Авторизация и аккуратное отображение списка заказов."""
     try:
-        # Получаем телефон
         if update.message.contact:
             phone = update.message.contact.phone_number
         else:
@@ -426,7 +606,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Не удалось распознать номер телефона.")
             return
 
-        # Нормализуем
         phone = (
             phone.replace("+", "")
             .replace(" ", "")
@@ -442,7 +621,6 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"Авторизация телефона: {phone}")
 
-        # Забираем пользователя из ABCP
         user = get_user_by_phone(phone)
         if not user:
             await update.message.reply_text("❌ Пользователь не найден.")
@@ -458,20 +636,17 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👤 {name}\n"
             f"💰 Баланс: {balance} ₽\n"
             f"💸 Задолженность: {debt} ₽\n\n"
-            f"⏳ Загружаем список заказов..."
+            f"⏳ Загружаем список заказов...",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
         context.user_data["abcp_user_id"] = user_id
         context.user_data["customer_name"] = name
-
-        # Грузим заказы и сохраняем в user_data
-        orders = await asyncio.to_thread(get_orders_by_user_id, user_id)
-        logger.info(f"Получено заказов: {len(orders)}")
+        context.user_data["phone"] = phone
 
         chat_id = update.effective_chat.id
         context.user_data["active_chat_id"] = chat_id
 
-        # Удаляем прошлые уведомления вачдога, чтобы в чате остался только свежий список.
         stale_messages = 0
         try:
             snapshots = await asyncio.to_thread(get_user_order_snapshots, user_id)
@@ -522,63 +697,15 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stale_messages,
             )
 
-        orders_list = orders or []
-        number_to_token, token_to_number = assign_order_tokens(
-            orders_list, context.user_data.get("orders_number_to_token")
-        )
-        context.user_data["orders_list"] = orders_list
-        context.user_data["orders_map"] = {
-            str(order.get("number")): order for order in orders_list if order.get("number")
-        }
-        context.user_data["orders_number_to_token"] = number_to_token
-        context.user_data["orders_token_to_number"] = token_to_number
+        synced = await sync_orders_context(context, force_refresh=True)
+        if not synced:
+            await update.message.reply_text("⚠️ Не удалось загрузить заказы. Попробуйте позже.")
+            return
 
-        metrics = calculate_orders_metrics(orders_list)
-        context.user_data["orders_metrics"] = metrics
-        preferred_filter = context.user_data.get("orders_filter")
-        if preferred_filter not in FILTER_MODES:
-            preferred_filter = "active" if metrics["active"] else "all"
-        context.user_data["orders_filter"] = preferred_filter
+        _, _, overview_text, keyboard = synced
+        await send_overview_message(update, context, overview_text, keyboard)
+        await refresh_menu_keyboard(context, chat_id=chat_id)
 
-        filtered_orders = filter_orders_for_view(orders_list, preferred_filter)
-
-        update_cache_from_orders(orders_list)
-        await asyncio.to_thread(persist_orders_snapshot, user_id, orders_list)
-
-        refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-        overview_text = format_orders_overview(
-            filtered_orders,
-            metrics,
-            preferred_filter,
-            refreshed_at,
-        )
-        keyboard = build_orders_keyboard(filtered_orders, number_to_token, preferred_filter)
-
-        prev_message_id = context.user_data.get("active_message_id")
-        if prev_message_id:
-            try:
-                await safe_edit_message_text(
-                    context.bot,
-                    chat_id,
-                    prev_message_id,
-                    overview_text,
-                    reply_markup=keyboard,
-                )
-            except Exception as edit_error:
-                logger.debug(f"Не удалось обновить прошлое сообщение: {edit_error}")
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=prev_message_id)
-                except Exception:
-                    pass
-                msg = await update.message.reply_text(overview_text, reply_markup=keyboard)
-                context.user_data["active_message_id"] = msg.message_id
-        else:
-            msg = await update.message.reply_text(overview_text, reply_markup=keyboard)
-            context.user_data["active_message_id"] = msg.message_id
-
-        context.user_data["orders_overview_text"] = overview_text
-        context.user_data["orders_filtered_list"] = filtered_orders
-        context.user_data["orders_last_synced"] = refreshed_at
         context.user_data["view"] = "overview"
 
         save_user(update.effective_user.id, phone, user_id)
@@ -587,6 +714,91 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
         await update.message.reply_text("⚠️ Ошибка при загрузке заказов. Подробности в логах.")
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает текстовые сообщения: команды и повторную авторизацию."""
+
+    message = update.message
+    if not message:
+        return
+
+    text = (message.text or "").strip()
+    if not text:
+        return
+
+    chat_id = message.chat.id
+    context.user_data.setdefault("active_chat_id", chat_id)
+
+    user_id = context.user_data.get("abcp_user_id")
+
+    if not user_id:
+        phone = extract_phone_number(text)
+        if phone:
+            await handle_contact(update, context)
+        else:
+            await message.reply_text(
+                "📱 Отправьте номер телефона или воспользуйтесь кнопкой \"Отправить номер телефона\".",
+                reply_markup=ReplyKeyboardMarkup(
+                    [[KeyboardButton("Отправить номер телефона", request_contact=True)]],
+                    resize_keyboard=True,
+                    one_time_keyboard=True,
+                ),
+            )
+        return
+
+    lower_text = text.lower()
+
+    if lower_text in {"📋 мои заказы", "мои заказы", "список заказов", "📋 список заказов"}:
+        synced = await sync_orders_context(context, force_refresh=False)
+        if not synced:
+            await message.reply_text("⚠️ Не удалось получить список заказов. Попробуйте позже.")
+            return
+        _, _, overview_text, keyboard = synced
+        await send_overview_message(update, context, overview_text, keyboard)
+        await refresh_menu_keyboard(context)
+        await try_delete_message(message)
+        return
+
+    if lower_text in {"🔄 обновить", "🔄 обновить заказы", "обновить заказы", "обновить список"}:
+        synced = await sync_orders_context(context, force_refresh=True)
+        if not synced:
+            await message.reply_text("⚠️ Не удалось обновить заказы. Попробуйте позже.")
+            return
+        _, _, overview_text, keyboard = synced
+        await send_overview_message(update, context, overview_text, keyboard)
+        await refresh_menu_keyboard(context)
+        await try_delete_message(message)
+        return
+
+    if lower_text.startswith("фильтр") or "фильтр" in lower_text:
+        if "в работе" in lower_text:
+            mode = "active"
+        elif "неоплач" in lower_text:
+            mode = "unpaid"
+        else:
+            mode = "all"
+
+        synced = await sync_orders_context(context, force_refresh=False, filter_mode=mode)
+        if not synced:
+            await message.reply_text("⚠️ Не удалось применить фильтр. Попробуйте позже.")
+            return
+        _, _, overview_text, keyboard = synced
+        await send_overview_message(update, context, overview_text, keyboard)
+        await refresh_menu_keyboard(context)
+        await try_delete_message(message)
+        return
+
+    phone_candidate = extract_phone_number(text)
+    if phone_candidate and phone_candidate != context.user_data.get("phone"):
+        await handle_contact(update, context)
+        return
+
+    await refresh_menu_keyboard(
+        context,
+        message_text="ℹ️ Используйте клавиатуру снизу, чтобы открыть список, обновить его или сменить фильтр.",
+    )
+    await try_delete_message(message)
 
 
 async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -600,49 +812,6 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["active_chat_id"] = chat_id
     context.user_data["active_message_id"] = query.message.message_id
 
-    async def sync_orders() -> (
-        tuple[list[dict], list[dict], str, InlineKeyboardMarkup] | None
-    ):
-        user_id = context.user_data.get("abcp_user_id")
-        if not user_id:
-            await query.answer("Нет данных для обновления", show_alert=True)
-            return None
-
-        orders = await asyncio.to_thread(get_orders_by_user_id, user_id)
-        orders_list = orders or []
-        context.user_data["orders_list"] = orders_list
-        context.user_data["orders_map"] = {
-            str(order.get("number")): order
-            for order in orders_list
-            if order.get("number")
-        }
-        number_to_token, token_to_number = assign_order_tokens(
-            orders_list, context.user_data.get("orders_number_to_token")
-        )
-        context.user_data["orders_number_to_token"] = number_to_token
-        context.user_data["orders_token_to_number"] = token_to_number
-        update_cache_from_orders(orders_list)
-        await asyncio.to_thread(persist_orders_snapshot, user_id, orders_list)
-        refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-        context.user_data["orders_last_synced"] = refreshed_at
-        metrics = calculate_orders_metrics(orders_list)
-        context.user_data["orders_metrics"] = metrics
-        current_filter = context.user_data.get("orders_filter")
-        if current_filter not in FILTER_MODES:
-            current_filter = "active" if metrics["active"] else "all"
-        context.user_data["orders_filter"] = current_filter
-        filtered_orders = filter_orders_for_view(orders_list, current_filter)
-        overview_text = format_orders_overview(
-            filtered_orders,
-            metrics,
-            current_filter,
-            refreshed_at,
-        )
-        context.user_data["orders_overview_text"] = overview_text
-        context.user_data["orders_filtered_list"] = filtered_orders
-        keyboard = build_orders_keyboard(filtered_orders, number_to_token, current_filter)
-        return orders_list, filtered_orders, overview_text, keyboard
-
     if data == "orders:back":
         orders = context.user_data.get("orders_list")
         metrics = context.user_data.get("orders_metrics")
@@ -652,7 +821,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             or metrics is None
             or current_filter not in FILTER_MODES
         ):
-            synced = await sync_orders()
+            synced = await sync_orders_context(context, force_refresh=True)
             if not synced:
                 return
             _, filtered_orders, text_block, keyboard = synced
@@ -677,11 +846,12 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as edit_error:
             logger.debug(f"Не удалось показать список заказов: {edit_error}")
         await query.answer()
+        await refresh_menu_keyboard(context, chat_id=chat_id)
         context.user_data["view"] = "overview"
         return
 
     if data == "orders:refresh":
-        synced = await sync_orders()
+        synced = await sync_orders_context(context, force_refresh=True)
         if not synced:
             return
         _, _, text_block, keyboard = synced
@@ -690,6 +860,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as edit_error:
             logger.debug(f"Не удалось обновить список заказов: {edit_error}")
         await query.answer("Список обновлён ✅", show_alert=False)
+        await refresh_menu_keyboard(context, chat_id=chat_id)
         context.user_data["view"] = "overview"
         return
 
@@ -706,7 +877,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
 
         orders = context.user_data.get("orders_list")
         if orders is None:
-            synced = await sync_orders()
+            synced = await sync_orders_context(context, force_refresh=True)
             if not synced:
                 return
             orders = context.user_data.get("orders_list", [])
@@ -737,6 +908,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         except Exception as edit_error:
             logger.debug(f"Не удалось применить фильтр заказов: {edit_error}")
         await query.answer("Фильтр применён ✅", show_alert=False)
+        await refresh_menu_keyboard(context, chat_id=chat_id)
         context.user_data["view"] = "overview"
         return
 
@@ -745,7 +917,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         token_to_number = context.user_data.get("orders_token_to_number", {})
         number = token_to_number.get(token)
         if not number:
-            synced = await sync_orders()
+            synced = await sync_orders_context(context, force_refresh=True)
             if not synced:
                 return
             token_to_number = context.user_data.get("orders_token_to_number", {})
@@ -753,7 +925,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         if not number:
             await query.answer("Заказ не найден", show_alert=True)
             return
-        synced = await sync_orders()
+        synced = await sync_orders_context(context, force_refresh=True)
         if not synced:
             return
         order = context.user_data.get("orders_map", {}).get(number)
@@ -803,7 +975,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         token_to_number = context.user_data.get("orders_token_to_number", {})
         number = token_to_number.get(token)
         if not number:
-            synced = await sync_orders()
+            synced = await sync_orders_context(context, force_refresh=True)
             if not synced:
                 return
             token_to_number = context.user_data.get("orders_token_to_number", {})
@@ -831,7 +1003,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         orders_map = context.user_data.get("orders_map", {})
         order = orders_map.get(number)
         if not order:
-            synced = await sync_orders()
+            synced = await sync_orders_context(context, force_refresh=True)
             if not synced:
                 return
             order = context.user_data.get("orders_map", {}).get(number)
@@ -1034,7 +1206,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_orders_callback))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     # Запускаем вачдог через JobQueue каждые 60 сек (первый запуск через 10 сек)
     app.job_queue.run_repeating(watchdog_job, interval=60, first=10, name="orders_watchdog")
