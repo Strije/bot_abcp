@@ -152,21 +152,71 @@ def format_orders_overview(orders: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_orders_keyboard(orders: list[dict]) -> InlineKeyboardMarkup:
+def assign_order_tokens(
+    orders: list[dict],
+    existing_map: dict[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Подбирает короткие токены для callback_data, чтобы избежать превышения лимита Telegram."""
+
+    existing_map = existing_map or {}
+    used_tokens: set[str] = set()
+    number_to_token: dict[str, str] = {}
+    token_to_number: dict[str, str] = {}
+    counter = 0
+
+    def next_token() -> str:
+        nonlocal counter
+        while True:
+            candidate = format(counter, "x")  # короткая hex-запись
+            counter += 1
+            if candidate not in used_tokens:
+                return candidate
+
+    for order in orders:
+        number = order.get("number")
+        if not number:
+            continue
+        number_str = str(number)
+        token = existing_map.get(number_str)
+        if token and token not in used_tokens:
+            assigned = token
+        else:
+            assigned = next_token()
+
+        used_tokens.add(assigned)
+        number_to_token[number_str] = assigned
+        token_to_number[assigned] = number_str
+
+    return number_to_token, token_to_number
+
+
+def build_orders_keyboard(
+    orders: list[dict],
+    number_to_token: dict[str, str] | None = None,
+) -> InlineKeyboardMarkup:
     if not orders:
         return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Обновить", callback_data="orders:refresh")]])
 
+    number_to_token = number_to_token or {}
     buttons: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
 
     for order in orders:
-        number = str(order.get("number", "-"))
+        number = order.get("number")
+        if not number:
+            continue
+
+        number_str = str(number)
+        token = number_to_token.get(number_str)
+        if not token:
+            continue
+
         total = order.get("sum")
-        title = f"№{number}"
+        title = f"№{number_str}"
         if total not in (None, ""):
             title += f" · {total} ₽"
 
-        row.append(InlineKeyboardButton(title, callback_data=f"order:{number}"))
+        row.append(InlineKeyboardButton(title, callback_data=f"order:{token}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -316,14 +366,20 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_id = update.effective_chat.id
         context.user_data["active_chat_id"] = chat_id
-        context.user_data["orders_list"] = orders or []
+        orders_list = orders or []
+        number_to_token, token_to_number = assign_order_tokens(
+            orders_list, context.user_data.get("orders_number_to_token")
+        )
+        context.user_data["orders_list"] = orders_list
         context.user_data["orders_map"] = {
-            str(order.get("number")): order for order in (orders or []) if order.get("number")
+            str(order.get("number")): order for order in orders_list if order.get("number")
         }
+        context.user_data["orders_number_to_token"] = number_to_token
+        context.user_data["orders_token_to_number"] = token_to_number
 
-        if not orders:
+        if not orders_list:
             empty_text = "🕐 У вас пока нет заказов."
-            keyboard = build_orders_keyboard([])
+            keyboard = build_orders_keyboard([], number_to_token)
             prev_message_id = context.user_data.get("active_message_id")
             if prev_message_id:
                 try:
@@ -350,12 +406,12 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_cache_from_orders([])
             return
 
-        update_cache_from_orders(orders)
+        update_cache_from_orders(orders_list)
 
-        overview_text = format_orders_overview(orders)
+        overview_text = format_orders_overview(orders_list)
         refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
         overview_text = f"{overview_text}\n\n🔄 Обновлено: {refreshed_at}"
-        keyboard = build_orders_keyboard(orders)
+        keyboard = build_orders_keyboard(orders_list, number_to_token)
 
         prev_message_id = context.user_data.get("active_message_id")
         if prev_message_id:
@@ -399,7 +455,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
     context.user_data["active_chat_id"] = chat_id
     context.user_data["active_message_id"] = query.message.message_id
 
-    async def sync_orders() -> tuple[list[dict], str] | None:
+    async def sync_orders() -> tuple[list[dict], str, InlineKeyboardMarkup] | None:
         user_id = context.user_data.get("abcp_user_id")
         if not user_id:
             await query.answer("Нет данных для обновления", show_alert=True)
@@ -413,23 +469,32 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             for order in orders_list
             if order.get("number")
         }
+        number_to_token, token_to_number = assign_order_tokens(
+            orders_list, context.user_data.get("orders_number_to_token")
+        )
+        context.user_data["orders_number_to_token"] = number_to_token
+        context.user_data["orders_token_to_number"] = token_to_number
         update_cache_from_orders(orders_list)
         refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
         context.user_data["orders_last_synced"] = refreshed_at
         overview_text = format_orders_overview(orders_list)
         overview_text = f"{overview_text}\n\n🔄 Обновлено: {refreshed_at}"
         context.user_data["orders_overview_text"] = overview_text
-        return orders_list, overview_text
+        keyboard = build_orders_keyboard(orders_list, number_to_token)
+        return orders_list, overview_text, keyboard
 
     if data == "orders:back":
         orders = context.user_data.get("orders_list", [])
+        number_to_token = context.user_data.get("orders_number_to_token", {})
         text_block = context.user_data.get("orders_overview_text")
         if text_block is None:
             synced = await sync_orders()
             if not synced:
                 return
-            orders, text_block = synced
-        keyboard = build_orders_keyboard(orders)
+            orders, text_block, keyboard = synced
+            number_to_token = context.user_data.get("orders_number_to_token", {})
+        else:
+            keyboard = build_orders_keyboard(orders, number_to_token)
         try:
             await safe_edit_query_message(query, text_block, keyboard)
         except Exception as edit_error:
@@ -442,9 +507,9 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         synced = await sync_orders()
         if not synced:
             return
-        orders, text_block = synced
+        _, text_block, keyboard = synced
         try:
-            await safe_edit_query_message(query, text_block, build_orders_keyboard(orders))
+            await safe_edit_query_message(query, text_block, keyboard)
         except Exception as edit_error:
             logger.debug(f"Не удалось обновить список заказов: {edit_error}")
         await query.answer("Список обновлён ✅", show_alert=False)
@@ -452,7 +517,18 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data.startswith("order-refresh:"):
-        number = data.split(":", 1)[1]
+        token = data.split(":", 1)[1]
+        token_to_number = context.user_data.get("orders_token_to_number", {})
+        number = token_to_number.get(token)
+        if not number:
+            synced = await sync_orders()
+            if not synced:
+                return
+            token_to_number = context.user_data.get("orders_token_to_number", {})
+            number = token_to_number.get(token)
+        if not number:
+            await query.answer("Заказ не найден", show_alert=True)
+            return
         synced = await sync_orders()
         if not synced:
             return
@@ -476,11 +552,18 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["view"] = "overview"
             return
 
+        number_to_token = context.user_data.get("orders_number_to_token", {})
+        refreshed_token = number_to_token.get(str(order.get("number")))
         detail_text = format_order_detail(order)
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("⬅️ Назад к списку", callback_data="orders:back")],
-                [InlineKeyboardButton("🔄 Обновить заказ", callback_data=f"order-refresh:{number}")],
+                [
+                    InlineKeyboardButton(
+                        "🔄 Обновить заказ",
+                        callback_data=f"order-refresh:{refreshed_token or token}",
+                    )
+                ],
             ]
         )
         try:
@@ -492,7 +575,32 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data.startswith("order:"):
-        number = data.split(":", 1)[1]
+        token = data.split(":", 1)[1]
+        token_to_number = context.user_data.get("orders_token_to_number", {})
+        number = token_to_number.get(token)
+        if not number:
+            synced = await sync_orders()
+            if not synced:
+                return
+            token_to_number = context.user_data.get("orders_token_to_number", {})
+            number = token_to_number.get(token)
+        if not number:
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔄 Обновить список", callback_data="orders:refresh")]]
+            )
+            try:
+                await safe_edit_query_message(
+                    query,
+                    "❌ Не удалось найти заказ. Обновите список и попробуйте снова.",
+                    keyboard,
+                )
+            except Exception as edit_error:
+                logger.debug(
+                    f"Не удалось показать сообщение о неизвестном токене заказа: {edit_error}"
+                )
+            await query.answer("Заказ не найден", show_alert=True)
+            context.user_data["view"] = "overview"
+            return
         orders_map = context.user_data.get("orders_map", {})
         order = orders_map.get(number)
         if not order:
@@ -517,11 +625,18 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
             context.user_data["view"] = "overview"
             return
 
+        number_to_token = context.user_data.get("orders_number_to_token", {})
+        refreshed_token = number_to_token.get(str(order.get("number")))
         detail_text = format_order_detail(order)
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("⬅️ Назад к списку", callback_data="orders:back")],
-                [InlineKeyboardButton("🔄 Обновить заказ", callback_data=f"order-refresh:{number}")],
+                [
+                    InlineKeyboardButton(
+                        "🔄 Обновить заказ",
+                        callback_data=f"order-refresh:{refreshed_token or token}",
+                    )
+                ],
             ]
         )
         try:
