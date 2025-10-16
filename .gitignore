@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.log
+*.db
+*.sqlite
+status_cache.json

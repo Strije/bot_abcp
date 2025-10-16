@@ -1,21 +1,18 @@
 import sys
 import asyncio
-import json
-import os
-from datetime import datetime
-from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+
+from telegram import KeyboardButton, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
-    JobQueue,
-    Job,
+    MessageHandler,
     filters,
 )
-from api import get_user_by_phone, get_orders_by_user_id
+
+from api import get_orders_by_user_id, get_user_by_phone
 from auth import extract_phone_number, save_user
-from db import init_db, get_all_users
+from db import get_user_by_telegram_id, init_db
 from config import BOT_TOKEN, OFFICE_ALIASES
 from logs_setup import setup_logging
 
@@ -23,33 +20,6 @@ from logs_setup import setup_logging
 # ЛОГИРОВАНИЕ
 # =========================
 logger = setup_logging("logs/bot.log")
-
-# =========================
-# КЭШ ДЛЯ ВАЧДОГА (файл + память)
-# =========================
-CACHE_FILE = "status_cache.json"
-_status_cache: dict[str, str] = {}  # {order_number: formatted_text}
-
-
-def load_cache() -> dict:
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception as e:
-            logger.warning(f"Не удалось прочитать {CACHE_FILE}: {e}")
-    return {}
-
-
-def save_cache():
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_status_cache, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"Не удалось сохранить {CACHE_FILE}: {e}")
-
 
 # =========================
 # ХЕЛПЕРЫ
@@ -70,10 +40,22 @@ def emoji_for_status_line(status: str) -> str:
 def format_order_status(order: dict) -> str:
     """Формирует текст статусов по позициям + адрес офиса."""
     number = order.get("number", "-")
+    date = order.get("date", "-")
     delivery_office = order.get("deliveryOffice", "") or ""
     office_address = OFFICE_ALIASES.get(delivery_office, delivery_office)
+    total_sum = order.get("sum", 0)
+    payment_type = order.get("paymentType", "-")
+    paid_text = "Оплачен" if order.get("paid") else "Не оплачен"
 
-    lines = [f"📦 Заказ №{number}", f"🏢 Офис: {office_address}\n"]
+    lines = [
+        f"📦 Заказ №{number}",
+        f"📅 Дата: {date}",
+        f"🏢 Офис: {office_address}",
+        f"💳 Оплата: {payment_type}",
+        f"💰 Сумма: {total_sum} ₽",
+        f"📍 Статус оплаты: {paid_text}",
+        "",
+    ]
     for pos in order.get("positions", []):
         brand = (pos.get("brand") or "").strip()
         desc = (pos.get("description") or "").strip()
@@ -81,12 +63,42 @@ def format_order_status(order: dict) -> str:
         price = pos.get("priceOut", "")
         qty = pos.get("quantity", "1")
 
-        lines.append(
-            f"{emoji_for_status_line(status)} {brand} {desc}\n"
-            f"   💵 {price} ₽ × {qty}\n"
-            f"   📄 {status}"
+        lines.extend(
+            [
+                f"{emoji_for_status_line(status)} {brand} {desc}",
+                f"   💵 {price} ₽ × {qty}",
+                f"   📄 {status}",
+                "",
+            ]
         )
-    return "\n".join(lines)
+    return "\n".join(lines).strip()
+
+
+# =========================
+# ПОМОЩНИКИ ДЛЯ ЗАГРУЗКИ И ОТПРАВКИ ЗАКАЗОВ
+# =========================
+async def fetch_orders(user_id: str) -> list[dict]:
+    """Неблокирующая обёртка вокруг синхронного запроса заказов."""
+    return await asyncio.to_thread(get_orders_by_user_id, user_id)
+
+
+async def send_orders_to_chat(
+    chat_id: int, user_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    """Возвращает количество найденных заказов и отправляет их пользователю."""
+
+    orders = await fetch_orders(user_id)
+    if not orders:
+        await context.bot.send_message(chat_id=chat_id, text="🕐 У вас пока нет заказов.")
+        return 0
+
+    await context.bot.send_message(
+        chat_id=chat_id, text=f"🧾 Найдено заказов: {len(orders)}"
+    )
+    for order in orders:
+        await context.bot.send_message(chat_id=chat_id, text=format_order_status(order))
+
+    return len(orders)
 
 
 # =========================
@@ -97,7 +109,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     button = KeyboardButton("Отправить номер телефона", request_contact=True)
     kb = ReplyKeyboardMarkup([[button]], one_time_keyboard=True, resize_keyboard=True)
     await update.message.reply_text(
-        "👋 Привет! Отправь свой номер телефона, чтобы получить информацию о заказах.",
+        "👋 Привет! Отправь свой номер телефона кнопкой ниже, чтобы получить информацию о заказах.\n"
+        "После авторизации можно в любой момент вызвать /orders и обновить статусы.",
         reply_markup=kb,
     )
 
@@ -154,104 +167,51 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Загружаем список заказов..."
         )
 
-        # Грузим заказы
-        orders = get_orders_by_user_id(user_id)
-        logger.info(f"Получено заказов: {len(orders)}")
-
-        if not orders:
-            await update.message.reply_text("🕐 У вас пока нет заказов.")
-            return
-
-        # Выводим каждый заказ: шапка + позиции построчно
-        for order in orders:
-            office = OFFICE_ALIASES.get(order.get("deliveryOffice", ""), "—")
-            header = (
-                f"📦 Заказ №{order.get('number', '-')}\n"
-                f"📅 {order.get('date', '-')}\n"
-                f"🏬 {office}\n"
-                f"💰 Сумма: {order.get('sum', 0)} ₽\n"
-                f"💳 Оплата: {order.get('paymentType', '-')}\n"
-                f"📍 Статус: {'Оплачен' if order.get('paid') else 'Не оплачен'}\n\n"
-                f"🧾 Позиции:"
-            )
-            await update.message.reply_text(header)
-
-            for pos in order.get("positions", []):
-                brand = pos.get("brand", "")
-                desc = pos.get("description", "")
-                status = pos.get("status", "")
-                price = pos.get("priceOut", "")
-                quantity = pos.get("quantity", "1")
-
-                emoji = emoji_for_status_line(status)
-                text = (
-                    f"{emoji} {brand} {desc}\n"
-                    f"   💵 {price} ₽ × {quantity}\n"
-                    f"   📄 {status}\n"
-                )
-                await update.message.reply_text(text)
+        # Грузим заказы неблокирующим образом и отправляем пользователю
+        total_orders = await send_orders_to_chat(update.effective_chat.id, user_id, context)
+        logger.info(f"Отправлено заказов: {total_orders}")
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
         await update.message.reply_text("⚠️ Ошибка при загрузке заказов. Подробности в логах.")
 
 
-# =========================
-# ВАЧДОГ: периодическая проверка заказов (каждые 60 сек)
-# =========================
-def build_changes_messages_for_user(user: dict) -> list[tuple[int, str]]:
-    """
-    Возвращает список (chat_id, message) для отправки,
-    только если у заказа изменился «сводный текст по позициям».
-    """
-    chat_id = user.get("telegram_id") or user.get("chat_id")
-    user_id = user.get("user_id") or user.get("abcp_user_id")
-    if not chat_id or not user_id:
-        logger.warning(f"⛔ Пропущен пользователь (нет chat_id или user_id): {user}")
-        return []
+async def orders_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Позволяет авторизованному пользователю обновить список заказов."""
 
-    orders = get_orders_by_user_id(user_id)
-    messages: list[tuple[int, str]] = []
+    message = update.effective_message
+    user_data = get_user_by_telegram_id(update.effective_user.id)
+    if not user_data:
+        await message.reply_text(
+            "⚠️ Я не знаю ваш номер телефона. Отправьте контакт через /start, чтобы авторизоваться."
+        )
+        return
 
-    for order in orders:
-        num = order.get("number")
-        text = format_order_status(order)
-        prev = _status_cache.get(num)
+    user_id = user_data.get("user_id")
+    if not user_id:
+        await message.reply_text("⚠️ Не удалось найти ID учётной записи. Отправьте контакт заново через /start.")
+        return
 
-        if text != prev:
-            # Изменилась любая позиция/статус — отправим
-            messages.append((chat_id, f"📢 Обновление статусов:\n\n{text}"))
-            _status_cache[num] = text
-
-    return messages
+    await message.reply_text("🔄 Обновляем статусы заказов...")
+    total_orders = await send_orders_to_chat(
+        update.effective_chat.id, user_id, context
+    )
+    logger.info(
+        "Команда /orders выполнена: пользователь %s, заказов отправлено %s",
+        update.effective_user.id,
+        total_orders,
+    )
 
 
-async def watchdog_job(context: ContextTypes.DEFAULT_TYPE):
-    """Запускается JobQueue-ой каждые 60 сек внутри event-loop приложения."""
-    try:
-        users = get_all_users()
-        if not users:
-            logger.info("[WD] Пользователей нет.")
-            return
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отображает краткую справку по доступным действиям."""
 
-        total_msgs = 0
-        for u in users:
-            msgs = await asyncio.to_thread(build_changes_messages_for_user, u)
-            for chat_id, text in msgs:
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=text)
-                    total_msgs += 1
-                except Exception as e:
-                    logger.exception(f"[WD] Ошибка отправки сообщения пользователю {chat_id}: {e}")
-
-        if total_msgs:
-            save_cache()
-            logger.info(f"[WD] Отправлено уведомлений: {total_msgs}")
-        else:
-            logger.info("[WD] Изменений нет.")
-
-    except Exception as e:
-        logger.exception(f"[WD] Ошибка фоновой проверки: {e}")
+    await update.effective_message.reply_text(
+        "ℹ️ Доступные команды:\n"
+        "• /start — авторизация по номеру телефона.\n"
+        "• /orders — получить актуальные статусы заказов после авторизации.\n"
+        "Также вы можете просто отправить свой номер телефоном или текстом, чтобы авторизоваться."
+    )
 
 
 # =========================
@@ -262,20 +222,18 @@ if __name__ == "__main__":
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # БД + кеш
+    # База данных
     init_db()
-    _status_cache = load_cache()
 
     # Telegram-приложение
     app = Application.builder().token(BOT_TOKEN).build()
 
     # Хэндлеры
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
 
-    # Запускаем вачдог через JobQueue каждые 60 сек (первый запуск через 10 сек)
-    app.job_queue.run_repeating(watchdog_job, interval=60, first=10, name="orders_watchdog")
-
-    logger.info("🤖 Бот запущен и готов к работе (watchdog: 60 сек).")
+    logger.info("🤖 Бот запущен и готов к работе.")
     app.run_polling()
