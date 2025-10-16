@@ -249,6 +249,28 @@ def update_cache_from_orders(orders: list[dict]):
         save_cache()
 
 
+def persist_orders_snapshot(user_id: str | int | None, orders: list[dict]):
+    """Сохраняет текущие статусы заказов в базе, чтобы вачдог не рассылал их повторно."""
+
+    if not user_id:
+        return
+
+    user_id_str = str(user_id)
+    for order in orders:
+        number = order.get("number")
+        if not number:
+            continue
+
+        number_str = str(number)
+        text = format_order_status(order)
+        try:
+            update_order_status(number_str, user_id_str, text)
+        except Exception as db_error:
+            logger.debug(
+                "Не удалось обновить снимок статуса заказа %s: %s", number_str, db_error
+            )
+
+
 async def safe_edit_message_text(
     bot,
     chat_id: int,
@@ -410,9 +432,11 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             context.user_data["orders_overview_text"] = empty_text
             update_cache_from_orders([])
+            await asyncio.to_thread(persist_orders_snapshot, user_id, [])
             return
 
         update_cache_from_orders(orders_list)
+        await asyncio.to_thread(persist_orders_snapshot, user_id, orders_list)
 
         overview_text = format_orders_overview(orders_list)
         refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -481,6 +505,7 @@ async def handle_orders_callback(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["orders_number_to_token"] = number_to_token
         context.user_data["orders_token_to_number"] = token_to_number
         update_cache_from_orders(orders_list)
+        await asyncio.to_thread(persist_orders_snapshot, user_id, orders_list)
         refreshed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
         context.user_data["orders_last_synced"] = refreshed_at
         overview_text = format_orders_overview(orders_list)

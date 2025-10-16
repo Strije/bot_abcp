@@ -50,9 +50,21 @@ def get_order_message(order_number):
 def update_order_status(order_number, user_id, status, message_id=None):
     conn = sqlite3.connect(DB_NAME)
     cur = conn.cursor()
-    cur.execute("""
+
+    # Если не передан message_id, сохраняем существующее значение, чтобы не терять
+    # привязку к сообщению с обновлениями.
+    if message_id is None:
+        cur.execute("SELECT message_id FROM orders WHERE order_number=?", (order_number,))
+        row = cur.fetchone()
+        if row and row[0] is not None:
+            message_id = row[0]
+
+    cur.execute(
+        """
     INSERT OR REPLACE INTO orders (order_number, user_id, status, message_id, last_update)
     VALUES (?, ?, ?, ?, ?)
-    """, (order_number, user_id, status, message_id, datetime.now()))
+    """,
+        (order_number, user_id, status, message_id, datetime.now()),
+    )
     conn.commit()
     conn.close()
