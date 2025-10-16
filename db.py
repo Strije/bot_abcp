@@ -1,5 +1,6 @@
 import sqlite3
 from datetime import datetime
+
 DB_NAME = "bot_data.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
@@ -65,6 +66,36 @@ def update_order_status(order_number, user_id, status, message_id=None):
     VALUES (?, ?, ?, ?, ?)
     """,
         (order_number, user_id, status, message_id, datetime.now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_order_snapshots(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT order_number, status, message_id FROM orders WHERE user_id=?",
+        (str(user_id),),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {
+            "order_number": row[0],
+            "status": row[1],
+            "message_id": row[2],
+        }
+        for row in rows
+    ]
+
+
+def clear_order_message(order_number):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE orders SET message_id=NULL WHERE order_number=?",
+        (order_number,),
     )
     conn.commit()
     conn.close()

@@ -29,6 +29,8 @@ from db import (
     get_order_status,
     get_order_message,
     update_order_status,
+    get_user_order_snapshots,
+    clear_order_message,
 )
 from config import BOT_TOKEN, OFFICE_ALIASES
 from logs_setup import setup_logging
@@ -468,6 +470,58 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         chat_id = update.effective_chat.id
         context.user_data["active_chat_id"] = chat_id
+
+        # Удаляем прошлые уведомления вачдога, чтобы в чате остался только свежий список.
+        stale_messages = 0
+        try:
+            snapshots = await asyncio.to_thread(get_user_order_snapshots, user_id)
+        except Exception as db_error:
+            logger.debug(
+                "Не удалось получить сохранённые сообщения заказов пользователя %s: %s",
+                user_id,
+                db_error,
+            )
+            snapshots = []
+
+        for snapshot in snapshots:
+            order_number = snapshot.get("order_number")
+            message_id = snapshot.get("message_id")
+            if message_id:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    stale_messages += 1
+                except BadRequest as exc:
+                    if "message to delete not found" not in str(exc).lower():
+                        logger.debug(
+                            "Не удалось удалить сообщение заказа %s (%s): %s",
+                            order_number,
+                            message_id,
+                            exc,
+                        )
+                except Exception as delete_error:
+                    logger.debug(
+                        "Ошибка при удалении сообщения заказа %s (%s): %s",
+                        order_number,
+                        message_id,
+                        delete_error,
+                    )
+            if order_number:
+                try:
+                    await asyncio.to_thread(clear_order_message, order_number)
+                except Exception as db_error:
+                    logger.debug(
+                        "Не удалось сбросить message_id заказа %s: %s",
+                        order_number,
+                        db_error,
+                    )
+
+        if stale_messages:
+            logger.info(
+                "Удалено устаревших уведомлений по заказам пользователя %s: %s",
+                user_id,
+                stale_messages,
+            )
+
         orders_list = orders or []
         number_to_token, token_to_number = assign_order_tokens(
             orders_list, context.user_data.get("orders_number_to_token")
@@ -844,6 +898,7 @@ def build_changes_actions_for_user(user: dict) -> list[dict]:
         return []
 
     actions: list[dict] = []
+    cache_dirty = False
 
     for order in orders:
         number = order.get("number")
@@ -859,6 +914,27 @@ def build_changes_actions_for_user(user: dict) -> list[dict]:
         if fresh_text == cache_text or fresh_text == stored_status:
             if cache_text != fresh_text:
                 _status_cache[number_str] = fresh_text
+                cache_dirty = True
+            continue
+
+        # Если в базе нет форматированного статуса (новый заказ или старые записи),
+        # фиксируем снапшот и не рассылаем уведомление, чтобы избежать спама.
+        if not stored_status or "Заказ №" not in stored_status:
+            try:
+                update_order_status(
+                    number_str,
+                    user_id,
+                    fresh_text,
+                    stored_message_id,
+                )
+            except Exception as db_error:
+                logger.debug(
+                    "[WD] Не удалось зафиксировать стартовый статус заказа %s: %s",
+                    number_str,
+                    db_error,
+                )
+            _status_cache[number_str] = fresh_text
+            cache_dirty = True
             continue
 
         actions.append(
@@ -871,6 +947,9 @@ def build_changes_actions_for_user(user: dict) -> list[dict]:
                 "raw_text": fresh_text,
             }
         )
+
+    if cache_dirty:
+        save_cache()
 
     return actions
 
