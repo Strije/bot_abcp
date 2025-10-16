@@ -3,6 +3,8 @@ import asyncio
 import json
 import os
 from datetime import datetime
+from types import SimpleNamespace
+from functools import partial
 from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -254,6 +256,31 @@ async def watchdog_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception(f"[WD] Ошибка фоновой проверки: {e}")
 
 
+
+async def _manual_watchdog_loop(
+    app: Application, interval: int, first: int
+) -> None:
+    """Ручной запуск вачдога, если JobQueue недоступен."""
+    try:
+        if first:
+            await asyncio.sleep(first)
+
+        context = SimpleNamespace(bot=app.bot, application=app)
+        while True:
+            await watchdog_job(context)  # type: ignore[arg-type]
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        logger.info("[WD] Ручной вачдог остановлен.")
+        raise
+
+
+async def _start_manual_watchdog(app: Application, interval: int, first: int) -> None:
+    logger.warning(
+        "JobQueue недоступна. Фоновая проверка заказов будет выполняться вручную. "
+        "Установите python-telegram-bot[job-queue], чтобы вернуть стандартную работу."
+    )
+    app.create_task(_manual_watchdog_loop(app, interval=interval, first=first))
+
 # =========================
 # MAIN
 # =========================
@@ -274,8 +301,25 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact))
 
-    # Запускаем вачдог через JobQueue каждые 60 сек (первый запуск через 10 сек)
-    app.job_queue.run_repeating(watchdog_job, interval=60, first=10, name="orders_watchdog")
+    # Запускаем вачдог каждые 60 сек (первый запуск через 10 сек)
+    watchdog_interval = 60
+    watchdog_first = 10
+
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            watchdog_job,
+            interval=watchdog_interval,
+            first=watchdog_first,
+            name="orders_watchdog",
+        )
+    else:
+        app.post_init(
+            partial(
+                _start_manual_watchdog,
+                interval=watchdog_interval,
+                first=watchdog_first,
+            )
+        )
 
     logger.info("🤖 Бот запущен и готов к работе (watchdog: 60 сек).")
     app.run_polling()
