@@ -305,8 +305,10 @@ if __name__ == "__main__":
     watchdog_interval = 60
     watchdog_first = 10
 
-    if app.job_queue:
-        app.job_queue.run_repeating(
+    job_queue = getattr(app, "job_queue", None)
+
+    if job_queue is not None:
+        job_queue.run_repeating(
             watchdog_job,
             interval=watchdog_interval,
             first=watchdog_first,
