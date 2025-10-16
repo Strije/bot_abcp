@@ -2,7 +2,9 @@ import sys
 import asyncio
 import json
 import os
+import re
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from telegram import (
     Update,
     KeyboardButton,
@@ -33,6 +35,7 @@ from db import (
     update_order_status,
     get_user_order_snapshots,
     clear_order_message,
+    get_user_id_by_order_number,
 )
 from config import BOT_TOKEN, OFFICE_ALIASES
 from logs_setup import setup_logging
@@ -409,7 +412,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Приветствие + запрос номера телефона."""
     button = KeyboardButton("Отправить номер телефона", request_contact=True)
     kb = ReplyKeyboardMarkup([[button]], one_time_keyboard=True, resize_keyboard=True)
-    await update.message.reply_text(
+    await clean_and_reply(
+        update.message,
+        context,
         "👋 Привет! Отправь свой номер телефона, чтобы получить информацию о заказах.",
         reply_markup=kb,
     )
@@ -440,11 +445,376 @@ def build_orders_menu_keyboard(current_filter: str | None = None) -> ReplyKeyboa
 MENU_HINT_TEXT = "👇 Быстрые действия доступны на клавиатуре ниже."
 
 
+def remember_cleanup_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
+    cleanup_list = context.user_data.setdefault("cleanup_message_ids", [])
+    if message_id not in cleanup_list:
+        cleanup_list.append(message_id)
+
+
+async def clear_user_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    preserve_ids: set[int] | None = None,
+):
+    """Удаляет отслеживаемые сообщения бота перед отправкой нового."""
+
+    preserve = set(preserve_ids or set())
+
+    tracked_ids = set(context.user_data.get("cleanup_message_ids", []))
+    for key in ("active_message_id", "menu_message_id"):
+        msg_id = context.user_data.get(key)
+        if msg_id:
+            tracked_ids.add(msg_id)
+
+    remaining: list[int] = []
+    for msg_id in tracked_ids:
+        if msg_id in preserve:
+            remaining.append(msg_id)
+            continue
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+        except BadRequest as exc:
+            if "message to delete not found" not in str(exc).lower():
+                logger.debug(f"Не удалось очистить сообщение {msg_id}: {exc}")
+        except Exception as error:
+            logger.debug(f"Ошибка при очистке сообщения {msg_id}: {error}")
+
+    context.user_data["cleanup_message_ids"] = remaining
+
+    if "active_message_id" not in preserve:
+        context.user_data.pop("active_message_id", None)
+    if "menu_message_id" not in preserve:
+        context.user_data.pop("menu_message_id", None)
+
+
+async def clean_and_reply(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    **kwargs,
+):
+    """Отправляет ответ, предварительно очищая предыдущие сообщения бота."""
+
+    if not message:
+        return None
+
+    chat_id = message.chat.id
+    await clear_user_chat(context, chat_id)
+    sent = await message.reply_text(text, **kwargs)
+    if sent:
+        remember_cleanup_message(context, sent.message_id)
+    return sent
+
+
+def normalize_order_number_hint(text: str) -> str | None:
+    digits = re.sub(r"\D", "", text or "")
+    if len(digits) >= 6:
+        return digits
+    return None
+
+
+def parse_sum_hint(text: str) -> Decimal | None:
+    if not text:
+        return None
+    cleaned = text.replace(" ", "").replace(",", ".")
+    match = re.search(r"\d+(?:\.\d{1,2})?", cleaned)
+    if not match:
+        return None
+    try:
+        return Decimal(match.group())
+    except InvalidOperation:
+        return None
+
+
+def parse_decimal_value(raw_value) -> Decimal | None:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip()
+    if not text:
+        return None
+    text = text.replace(" ", "").replace(",", ".")
+    try:
+        return Decimal(text)
+    except InvalidOperation:
+        return None
+
+
+def _resolve_user_by_hint(hint_type: str, hint_value):
+    """Ищет пользователя по номеру или сумме заказа среди известных аккаунтов."""
+
+    users = get_all_users()
+    checked_users: set[str] = set()
+
+    target_number: str | None = None
+    if hint_type == "order_number":
+        target_number = str(hint_value)
+        mapped_user_id = get_user_id_by_order_number(target_number)
+        if mapped_user_id:
+            orders = get_orders_by_user_id(mapped_user_id) or []
+            for order in orders:
+                if str(order.get("number")) == target_number:
+                    return {
+                        "user_id": str(mapped_user_id),
+                        "order": order,
+                        "order_number": target_number,
+                        "match_type": "order_number",
+                    }
+
+    target_sum: Decimal | None = None
+    if hint_type == "order_sum" and isinstance(hint_value, Decimal):
+        target_sum = hint_value
+
+    for entry in users:
+        user_id = str(entry.get("user_id") or entry.get("abcp_user_id") or "")
+        if not user_id or user_id in checked_users:
+            continue
+        checked_users.add(user_id)
+
+        orders = get_orders_by_user_id(user_id) or []
+        for order in orders:
+            order_number = str(order.get("number") or "")
+            order_sum_value = parse_decimal_value(order.get("sum"))
+
+            if hint_type == "order_number" and target_number:
+                if order_number == target_number:
+                    return {
+                        "user_id": user_id,
+                        "order": order,
+                        "order_number": target_number,
+                        "account_phone": entry.get("phone"),
+                        "match_type": "order_number",
+                    }
+
+            if (
+                hint_type == "order_sum"
+                and target_sum is not None
+                and order_sum_value is not None
+                and abs(order_sum_value - target_sum) < Decimal("0.01")
+            ):
+                return {
+                    "user_id": user_id,
+                    "order": order,
+                    "order_sum": target_sum,
+                    "account_phone": entry.get("phone"),
+                    "match_type": "order_sum",
+                }
+
+    return None
+
+
+async def resolve_user_by_hint(hint_type: str, hint_value):
+    return await asyncio.to_thread(_resolve_user_by_hint, hint_type, hint_value)
+
+
+async def complete_authorization_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    user_profile: dict,
+    phone: str,
+    account_phone: str | None = None,
+    summary_text: str | None = None,
+    summary_markup: ReplyKeyboardRemove | None = None,
+    prefix_text: str | None = None,
+) -> bool:
+    message = update.message
+    chat = update.effective_chat
+    if not chat:
+        return False
+
+    user_id = str(user_profile.get("userId") or user_profile.get("user_id") or "")
+    if not user_id:
+        if message:
+            await clean_and_reply(
+                message,
+                context,
+                "⚠️ Не удалось определить пользователя. Обратитесь к менеджеру.",
+            )
+        return False
+
+    name = user_profile.get("name") or "—"
+
+    if summary_text and message:
+        await clean_and_reply(
+            message,
+            context,
+            summary_text,
+            reply_markup=summary_markup,
+        )
+
+    context.user_data["abcp_user_id"] = user_id
+    context.user_data["customer_name"] = name
+    context.user_data["phone"] = phone
+    context.user_data["account_phone"] = account_phone or phone
+    context.user_data["active_chat_id"] = chat.id
+
+    stale_messages = 0
+    try:
+        snapshots = await asyncio.to_thread(get_user_order_snapshots, user_id)
+    except Exception as db_error:
+        logger.debug(
+            "Не удалось получить сохранённые сообщения заказов пользователя %s: %s",
+            user_id,
+            db_error,
+        )
+        snapshots = []
+
+    for snapshot in snapshots:
+        order_number = snapshot.get("order_number")
+        message_id = snapshot.get("message_id")
+        if message_id:
+            try:
+                await context.bot.delete_message(chat_id=chat.id, message_id=message_id)
+                stale_messages += 1
+            except BadRequest as exc:
+                if "message to delete not found" not in str(exc).lower():
+                    logger.debug(
+                        "Не удалось удалить сообщение заказа %s (%s): %s",
+                        order_number,
+                        message_id,
+                        exc,
+                    )
+            except Exception as delete_error:
+                logger.debug(
+                    "Ошибка при удалении сообщения заказа %s (%s): %s",
+                    order_number,
+                    message_id,
+                    delete_error,
+                )
+        if order_number:
+            try:
+                await asyncio.to_thread(clear_order_message, order_number)
+            except Exception as db_error:
+                logger.debug(
+                    "Не удалось сбросить message_id заказа %s: %s",
+                    order_number,
+                    db_error,
+                )
+
+    if stale_messages:
+        logger.info(
+            "Удалено устаревших уведомлеий по заказам пользователя %s: %s",
+            user_id,
+            stale_messages,
+        )
+
+    synced = await sync_orders_context(context, force_refresh=True)
+    if not synced:
+        if message:
+            await clean_and_reply(
+                message,
+                context,
+                "⚠️ Не удалось загрузить заказы. Попробуйте позже.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        return False
+
+    _, _, overview_text, keyboard = synced
+    await send_overview_message(
+        update,
+        context,
+        overview_text,
+        keyboard,
+        prefix_text=prefix_text,
+    )
+    await refresh_menu_keyboard(context, chat_id=chat.id)
+
+    context.user_data["view"] = "overview"
+    save_user(update.effective_user.id, account_phone or phone, user_id)
+    logger.info(
+        "Пользователь %s (%s) успешно авторизован.",
+        name,
+        user_id,
+    )
+    context.user_data.pop("auth_state", None)
+    return True
+
+
+async def attempt_alternative_authorization(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    hint_text: str,
+) -> bool:
+    auth_state = context.user_data.get("auth_state") or {}
+    pending_phone = auth_state.get("phone")
+    if not pending_phone:
+        return False
+
+    new_phone = extract_phone_number(hint_text)
+    if new_phone and new_phone != pending_phone:
+        await handle_contact(update, context)
+        return True
+
+    order_number = normalize_order_number_hint(hint_text)
+    match = None
+    if order_number:
+        match = await resolve_user_by_hint("order_number", order_number)
+
+    if not match:
+        sum_hint = parse_sum_hint(hint_text)
+        if sum_hint is not None:
+            match = await resolve_user_by_hint("order_sum", sum_hint)
+
+    if not match:
+        await clean_and_reply(
+            update.message,
+            context,
+            "❌ Не удалось подтвердить аккаунт по указанным данным. "
+            "Отправьте номер заказа (например 234808176) или сумму заказа в рублях.",
+        )
+        return False
+
+    account_phone = match.get("account_phone") or auth_state.get("account_phone")
+    user_profile = None
+    if account_phone:
+        user_profile = await asyncio.to_thread(get_user_by_phone, account_phone)
+
+    if not user_profile:
+        order = match.get("order") or {}
+        user_profile = {
+            "userId": match.get("user_id"),
+            "name": order.get("clientName")
+            or order.get("userName")
+            or auth_state.get("name")
+            or "Клиент",
+            "balance": order.get("clientBalance") or order.get("balance") or "—",
+            "debt": order.get("clientDebt") or order.get("debt") or "—",
+        }
+
+    summary_lines = ["✅ Дополнительная проверка пройдена."]
+    if match.get("match_type") == "order_number":
+        summary_lines.append(f"📦 Номер заказа: {match.get('order_number')}")
+    elif match.get("match_type") == "order_sum":
+        summary_lines.append(
+            f"💰 Сумма заказа: {match.get('order_sum')} ₽"
+        )
+    summary_lines.append("⏳ Загружаем список заказов...")
+    summary_text = "\n".join(summary_lines)
+
+    success = await complete_authorization_flow(
+        update,
+        context,
+        user_profile=user_profile,
+        phone=pending_phone,
+        account_phone=account_phone or user_profile.get("phone"),
+        summary_text=summary_text,
+        summary_markup=ReplyKeyboardRemove(),
+    )
+
+    if success:
+        await try_delete_message(update.message)
+        return True
+    return False
+
+
 async def send_overview_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     overview_text: str,
     keyboard: InlineKeyboardMarkup,
+    *,
+    prefix_text: str | None = None,
 ) -> None:
     """Редактирует существующее сообщение со списком заказов или отправляет новое."""
 
@@ -452,13 +822,17 @@ async def send_overview_message(
     context.user_data["active_chat_id"] = chat_id
     prev_message_id = context.user_data.get("active_message_id")
 
+    full_text = (
+        f"{prefix_text}\n\n{overview_text}" if prefix_text else overview_text
+    )
+
     if prev_message_id:
         try:
             await safe_edit_message_text(
                 context.bot,
                 chat_id,
                 prev_message_id,
-                overview_text,
+                full_text,
                 reply_markup=keyboard,
             )
             return
@@ -469,12 +843,15 @@ async def send_overview_message(
             except Exception:
                 pass
 
+    await clear_user_chat(context, chat_id)
+
     msg = await context.bot.send_message(
         chat_id=chat_id,
-        text=overview_text,
+        text=full_text,
         reply_markup=keyboard,
     )
     context.user_data["active_message_id"] = msg.message_id
+    remember_cleanup_message(context, msg.message_id)
 
 
 async def try_delete_message(message: Message | None):
@@ -523,6 +900,7 @@ async def refresh_menu_keyboard(
         reply_markup=keyboard,
     )
     context.user_data["menu_message_id"] = sent.message_id
+    remember_cleanup_message(context, sent.message_id)
 
 
 async def sync_orders_context(
@@ -597,13 +975,18 @@ async def sync_orders_context(
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Авторизация и аккуратное отображение списка заказов."""
     try:
-        if update.message.contact:
-            phone = update.message.contact.phone_number
+        message = update.message
+        if message and message.contact:
+            phone = message.contact.phone_number
         else:
-            phone = extract_phone_number(update.message.text or "")
+            phone = extract_phone_number((message.text if message else "") or "")
 
         if not phone:
-            await update.message.reply_text("❌ Не удалось распознать номер телефона.")
+            await clean_and_reply(
+                update.message,
+                context,
+                "❌ Не удалось распознать номер телефона.",
+            )
             return
 
         phone = (
@@ -621,99 +1004,54 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         logger.info(f"Авторизация телефона: {phone}")
 
-        user = get_user_by_phone(phone)
+        user = await asyncio.to_thread(get_user_by_phone, phone)
         if not user:
-            await update.message.reply_text("❌ Пользователь не найден.")
+            context.user_data["auth_state"] = {
+                "step": "await_hint",
+                "phone": phone,
+            }
+            await clean_and_reply(
+                update.message,
+                context,
+                "📭 С этим номером телефона профиль не найден. "
+                "Если на сайте указан другой номер, пришлите его или отправьте номер "
+                "последнего заказа (например 234808176) либо сумму заказа для подтверждения.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
             return
 
-        user_id = user.get("userId")
         name = user.get("name", "—")
         balance = user.get("balance", "0.00")
         debt = user.get("debt", "0.00")
 
-        await update.message.reply_text(
-            f"✅ Авторизация прошла успешно!\n"
+        summary_text = (
+            "✅ Авторизация прошла успешно!\n"
             f"👤 {name}\n"
             f"💰 Баланс: {balance} ₽\n"
             f"💸 Задолженность: {debt} ₽\n\n"
-            f"⏳ Загружаем список заказов...",
-            reply_markup=ReplyKeyboardRemove(),
+            "⏳ Загружаем список заказов..."
         )
 
-        context.user_data["abcp_user_id"] = user_id
-        context.user_data["customer_name"] = name
-        context.user_data["phone"] = phone
+        success = await complete_authorization_flow(
+            update,
+            context,
+            user_profile=user,
+            phone=phone,
+            account_phone=phone,
+            summary_text=summary_text,
+            summary_markup=ReplyKeyboardRemove(),
+        )
 
-        chat_id = update.effective_chat.id
-        context.user_data["active_chat_id"] = chat_id
-
-        stale_messages = 0
-        try:
-            snapshots = await asyncio.to_thread(get_user_order_snapshots, user_id)
-        except Exception as db_error:
-            logger.debug(
-                "Не удалось получить сохранённые сообщения заказов пользователя %s: %s",
-                user_id,
-                db_error,
-            )
-            snapshots = []
-
-        for snapshot in snapshots:
-            order_number = snapshot.get("order_number")
-            message_id = snapshot.get("message_id")
-            if message_id:
-                try:
-                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-                    stale_messages += 1
-                except BadRequest as exc:
-                    if "message to delete not found" not in str(exc).lower():
-                        logger.debug(
-                            "Не удалось удалить сообщение заказа %s (%s): %s",
-                            order_number,
-                            message_id,
-                            exc,
-                        )
-                except Exception as delete_error:
-                    logger.debug(
-                        "Ошибка при удалении сообщения заказа %s (%s): %s",
-                        order_number,
-                        message_id,
-                        delete_error,
-                    )
-            if order_number:
-                try:
-                    await asyncio.to_thread(clear_order_message, order_number)
-                except Exception as db_error:
-                    logger.debug(
-                        "Не удалось сбросить message_id заказа %s: %s",
-                        order_number,
-                        db_error,
-                    )
-
-        if stale_messages:
-            logger.info(
-                "Удалено устаревших уведомлений по заказам пользователя %s: %s",
-                user_id,
-                stale_messages,
-            )
-
-        synced = await sync_orders_context(context, force_refresh=True)
-        if not synced:
-            await update.message.reply_text("⚠️ Не удалось загрузить заказы. Попробуйте позже.")
-            return
-
-        _, _, overview_text, keyboard = synced
-        await send_overview_message(update, context, overview_text, keyboard)
-        await refresh_menu_keyboard(context, chat_id=chat_id)
-
-        context.user_data["view"] = "overview"
-
-        save_user(update.effective_user.id, phone, user_id)
-        logger.info(f"Пользователь {name} ({user_id}) успешно авторизован.")
+        if success:
+            await try_delete_message(update.message)
 
     except Exception as e:
         logger.exception(f"Ошибка при авторизации или выводе заказов: {e}")
-        await update.message.reply_text("⚠️ Ошибка при загрузке заказов. Подробности в логах.")
+        await clean_and_reply(
+            update.message,
+            context,
+            "⚠️ Ошибка при загрузке заказов. Подробности в логах.",
+        )
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -730,6 +1068,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = message.chat.id
     context.user_data.setdefault("active_chat_id", chat_id)
 
+    auth_state = context.user_data.get("auth_state") or {}
+    if auth_state.get("step") == "await_hint":
+        await attempt_alternative_authorization(update, context, text)
+        return
+
     user_id = context.user_data.get("abcp_user_id")
 
     if not user_id:
@@ -737,7 +1080,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         if phone:
             await handle_contact(update, context)
         else:
-            await message.reply_text(
+            await clean_and_reply(
+                message,
+                context,
                 "📱 Отправьте номер телефона или воспользуйтесь кнопкой \"Отправить номер телефона\".",
                 reply_markup=ReplyKeyboardMarkup(
                     [[KeyboardButton("Отправить номер телефона", request_contact=True)]],
@@ -752,7 +1097,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if lower_text in {"📋 мои заказы", "мои заказы", "список заказов", "📋 список заказов"}:
         synced = await sync_orders_context(context, force_refresh=False)
         if not synced:
-            await message.reply_text("⚠️ Не удалось получить список заказов. Попробуйте позже.")
+            await clean_and_reply(
+                message,
+                context,
+                "⚠️ Не удалось получить список заказов. Попробуйте позже.",
+            )
             return
         _, _, overview_text, keyboard = synced
         await send_overview_message(update, context, overview_text, keyboard)
@@ -763,7 +1112,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     if lower_text in {"🔄 обновить", "🔄 обновить заказы", "обновить заказы", "обновить список"}:
         synced = await sync_orders_context(context, force_refresh=True)
         if not synced:
-            await message.reply_text("⚠️ Не удалось обновить заказы. Попробуйте позже.")
+            await clean_and_reply(
+                message,
+                context,
+                "⚠️ Не удалось обновить заказы. Попробуйте позже.",
+            )
             return
         _, _, overview_text, keyboard = synced
         await send_overview_message(update, context, overview_text, keyboard)
@@ -781,7 +1134,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         synced = await sync_orders_context(context, force_refresh=False, filter_mode=mode)
         if not synced:
-            await message.reply_text("⚠️ Не удалось применить фильтр. Попробуйте позже.")
+            await clean_and_reply(
+                message,
+                context,
+                "⚠️ Не удалось применить фильтр. Попробуйте позже.",
+            )
             return
         _, _, overview_text, keyboard = synced
         await send_overview_message(update, context, overview_text, keyboard)

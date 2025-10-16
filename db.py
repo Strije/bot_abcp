@@ -99,3 +99,17 @@ def clear_order_message(order_number):
     )
     conn.commit()
     conn.close()
+
+
+def get_user_id_by_order_number(order_number: str) -> str | None:
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT user_id FROM orders WHERE order_number=?",
+        (str(order_number),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        return str(row[0])
+    return None
